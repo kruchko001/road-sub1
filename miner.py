@@ -140,10 +140,13 @@ class Miner:
 
     def _warmup(self) -> None:
         self._input_tensor.fill(0.0)
-        self.session.run(
-            self.output_names,
-            {self.input_name: self._input_tensor, self.size_name: self._sizes},
-        )
+        if self._on_cuda:
+            self.session.run(
+                self.output_names,
+                {self.input_name: self._input_tensor, self.size_name: self._sizes},
+            )
+        else:
+            self.session.run_with_iobinding(self._io_binding)
 
     @staticmethod
     def _nms(boxes: ndarray, scores: ndarray, iou_thres: float) -> list[int]:
@@ -184,21 +187,25 @@ class Miner:
         cv2.cvtColor(self._canvas, cv2.COLOR_BGR2RGB, dst=self._rgb)
 
         chw = self._input_tensor[0]
-        chw[:] = self._rgb.transpose(2, 0, 1).astype(np.float32, copy=False) / 255.0
+        np.copyto(
+            chw,
+            self._rgb.transpose(2, 0, 1).astype(np.float32, copy=False) / 255.0,
+        )
         return ratio, pad_w, pad_h
 
     def _run_inference(self) -> None:
         if self._on_cuda:
-            # CUDA EP caches the first bound input on device; re-bind after letterbox.
-            self._io_binding.clear_binding_inputs()
-            self._io_binding.bind_cpu_input(self.input_name, self._input_tensor)
-            self._io_binding.bind_cpu_input(self.size_name, self._sizes)
-        self.session.run_with_iobinding(self._io_binding)
-        if self._on_cuda:
-            labels, boxes, scores = self._io_binding.copy_outputs_to_cpu()
-            np.copyto(self._out_labels, labels)
+            # CUDA EP: bind_cpu_input after clear_binding_inputs() raises
+            # "Invalid argument" on chutes; use session.run instead.
+            _, boxes, scores = self.session.run(
+                self.output_names,
+                {self.input_name: self._input_tensor, self.size_name: self._sizes},
+            )
             np.copyto(self._out_boxes, boxes)
             np.copyto(self._out_scores, scores)
+            return
+
+        self.session.run_with_iobinding(self._io_binding)
 
     def _decode(self, boxes, scores, ratio, pad_w, pad_h, orig_w, orig_h):
         primary = scores > self.conf_thres
