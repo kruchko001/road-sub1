@@ -1,3 +1,4 @@
+import traceback
 from pathlib import Path
 
 import cv2
@@ -42,8 +43,8 @@ class Miner:
 
         try:
             ort.preload_dlls()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"miner init: preload_dlls failed: {e}", flush=True)
 
         sess_options = ort.SessionOptions()
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -58,12 +59,17 @@ class Miner:
                 disabled_optimizers=["SimplifiedLayerNormFusion"],
                 providers=providers,
             )
-        except Exception:
+        except Exception as e:
+            print(
+                f"miner init: session creation failed, retrying without disabled optimizers: {e}",
+                flush=True,
+            )
             try:
                 self.session = ort.InferenceSession(
                     str(model_path), sess_options=sess_options, providers=providers
                 )
-            except Exception:
+            except Exception as e2:
+                print(f"miner init: session creation failed, falling back to CPU: {e2}", flush=True)
                 self.session = ort.InferenceSession(
                     str(model_path),
                     sess_options=sess_options,
@@ -281,7 +287,12 @@ class Miner:
             frame_id = offset + i
             try:
                 frame_boxes = self._predict_single(image)
-            except Exception:
+            except Exception as e:
+                print(
+                    f"predict_batch: inference failed for frame_id={frame_id}: {e}",
+                    flush=True,
+                )
+                traceback.print_exc()
                 frame_boxes = []
 
             results.append(TVFrameResult(
