@@ -1,0 +1,21 @@
+# ONNX / numpy versions match requirements.txt. Miner is ONNX-only (no torch on chute).
+Image:
+  from_base: parachutes/python:3.12
+  run_command:
+    - pip install --upgrade setuptools wheel
+    - pip install 'numpy>=1.23,<3' 'onnxruntime-gpu[cuda,cudnn]==1.23.2' 'opencv-python-headless>=4.7' 'huggingface_hub>=0.19.4' 'pydantic>=2.0' 'pyyaml>=6.0' 'aiohttp>=3.9'
+
+NodeSelector:
+  gpu_count: 1
+  min_vram_gb_per_gpu: 16
+  max_hourly_price_per_gpu: 1
+  include:
+    - rtx3090
+
+Chute:
+  timeout_seconds: 900
+  concurrency: 4
+  max_instances: 5
+  scaling_threshold: 0.5
+  shutdown_after_seconds: 86400
+  tee: true
