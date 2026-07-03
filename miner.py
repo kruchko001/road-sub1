@@ -25,28 +25,18 @@ class TVFrameResult(BaseModel):
 
 
 class Miner:
-    """RT-DETRv4 ONNX miner with road1 post-processing pipeline.
-
-    Inference stack from new_640-16-aug (640 input, IO binding, dual inputs).
-    Post-processing ported from road1: per-class conf + rescue bonus, sanity
-    box filter, per-class NMS, cross-class dedup, optional flip/tile TTA.
-    """
-
-    # --- RT-DETR inference ---
     input_size = 640
     num_queries = 300
     interp = cv2.INTER_AREA
     use_cuda_graph = False
 
-    # --- road1 post-processing ---
     class_names = ["road_sign"]
 
-    # Tuned on manako last-60-blocks (tools/tune_new_640.py, final=0.498).
-    iou_thres = 0.4
+    iou_thres = 0.5
     cross_iou_thresh = 0.8
     max_det = 150
 
-    _conf_thres_array = np.array([0.46], dtype=np.float32)
+    _conf_thres_array = np.array([0.40], dtype=np.float32)
     _bonus_array = np.array([0.05], dtype=np.float32)
 
     min_box_area = 9
