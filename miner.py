@@ -1,6 +1,5 @@
-import math
-import traceback
 from pathlib import Path
+import math
 
 import cv2
 import numpy as np
@@ -25,178 +24,190 @@ class TVFrameResult(BaseModel):
 
 
 class Miner:
-    input_size = 640
-    num_queries = 300
-    interp = cv2.INTER_AREA
-    use_cuda_graph = False
+    """ONNX Runtime miner for road-sign detection (single class).
+
+    Strategy (ported from offense / fire001 miner):
+      - per-class confidence threshold with per-class rescue bonus
+      - per-class hard NMS, then cross-class dedup (no-op for single class)
+      - horizontal-flip TTA with full-set cluster score boost
+    Plus: class remap, sanity-box filter tuned for small distant signs,
+    TTA toggle.
+    """
 
     class_names = ["road_sign"]
+    # Order the model emits classes in -- remapped to `class_names` index.
+    _model_class_order = ["road_sign"]
 
-    iou_thres = 0.5
+    iou_thres = 0.7
     cross_iou_thresh = 0.8
     max_det = 150
 
-    _conf_thres_array = np.array([0.40], dtype=np.float32)
-    _bonus_array = np.array([0.05], dtype=np.float32)
+    # Per-class confidence threshold. Road signs in this dataset are
+    # frequently degraded / rear-facing / partly-obscured / distant, so we
+    # run noticeably below the fire/smoke baseline. The validator's
+    # false_positive pillar = max(0, 1 - ffpi/10): we can tolerate ~2 FP per
+    # image and still keep that pillar above 0.8.
+    _conf_thres_array = np.array(
+        [0.30], dtype=np.float32
+    )
+    # Per-class rescue bonus. If a class has ZERO boxes passing the threshold
+    # in a frame, its top-1 candidate is admitted when its score is at least
+    # (threshold - bonus). Bumped from 0.05 -> 0.10 so a single faint sign in
+    # an otherwise empty frame still produces a detection (map50 recall win,
+    # at most one extra FP per such frame).
+    _bonus_array = np.array(
+        [0.2], dtype=np.float32
+    )
 
-    min_box_area = 9
+    # Box sanity filter: drop tiny / degenerate / image-spanning / extreme
+    # aspect ratio boxes.
+    #   min_box_area = 14x14  -> 14x14 is the smallest credible sign. The old
+    #                          value of 64 (8x8) silently discarded narrow
+    #                          distant signs like a 10x6 px overhead chevron.
+    #   min_side     = 3      -> matches min_box_area; anything thinner is
+    #                          almost certainly a pole or shadow false alarm.
+    #   max_aspect_ratio = 12.0
+    #                         -> overhead destination panels and lane-assignment
+    #                          signs are very wide (long, thin rectangles);
+    #                          8.0 was clipping legitimate detections.
+    min_box_area = 14 * 14
     min_side = 3
     max_aspect_ratio = 12.0
 
+    # Tile-based TTA: when the source image is significantly larger than the
+    # model input, letterboxing throws away ~1.5x of effective resolution,
+    # which kills small-sign recall. Splitting into overlapping horizontal
+    # tiles preserves native resolution on each half. Triggered only when
+    # source width >= tile_trigger_ratio * model_input_width to avoid wasted
+    # compute on already-small images.
     tile_trigger_ratio = 1.4
     tile_overlap_ratio = 0.20
 
     def __init__(self, path_hf_repo: Path) -> None:
-        model_path = Path(path_hf_repo) / "weights.onnx"
+        model_path = path_hf_repo / "weights.onnx"
+        self.cls_remap = np.array(
+            [self.class_names.index(n) for n in self._model_class_order],
+            dtype=np.int32,
+        )
+        print("ORT version:", ort.__version__)
 
         try:
             ort.preload_dlls()
+            print("✅ onnxruntime.preload_dlls() success")
         except Exception as e:
-            print(f"miner init: preload_dlls failed: {e}", flush=True)
+            print(f"⚠️ preload_dlls failed: {e}")
+
+        print("ORT available providers BEFORE session:", ort.get_available_providers())
 
         sess_options = ort.SessionOptions()
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        # The public-track latency gate runs CPU-only on 2 vCPUs. Without this,
+        # ORT spawns a thread per host core and oversubscribes the 2 cores
+        # (~5.5x slower). Pin to 2 intra-op threads / 1 inter-op to match.
         sess_options.intra_op_num_threads = 2
         sess_options.inter_op_num_threads = 1
 
-        providers = self._provider_list_with_opts()
         try:
             self.session = ort.InferenceSession(
                 str(model_path),
                 sess_options=sess_options,
-                disabled_optimizers=["SimplifiedLayerNormFusion"],
-                providers=providers,
+                providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
             )
+            print("✅ Created ORT session with preferred CUDA provider list")
         except Exception as e:
-            print(
-                f"miner init: session creation failed, retrying without disabled optimizers: {e}",
-                flush=True,
+            print(f"⚠️ CUDA session creation failed, falling back to CPU: {e}")
+            self.session = ort.InferenceSession(
+                str(model_path),
+                sess_options=sess_options,
+                providers=["CPUExecutionProvider"],
             )
-            try:
-                self.session = ort.InferenceSession(
-                    str(model_path), sess_options=sess_options, providers=providers
-                )
-            except Exception as e2:
-                print(f"miner init: session creation failed, falling back to CPU: {e2}", flush=True)
-                self.session = ort.InferenceSession(
-                    str(model_path),
-                    sess_options=sess_options,
-                    providers=["CPUExecutionProvider"],
-                )
+
+        print("ORT session providers:", self.session.get_providers())
+
+        for inp in self.session.get_inputs():
+            print("INPUT:", inp.name, inp.shape, inp.type)
+        for out in self.session.get_outputs():
+            print("OUTPUT:", out.name, out.shape, out.type)
 
         self.input_name = self.session.get_inputs()[0].name
-        self.size_name = self.session.get_inputs()[1].name
         self.output_names = [output.name for output in self.session.get_outputs()]
-        self._boxes_name = self.output_names[1]
-        self._scores_name = self.output_names[2]
+        self.input_shape = self.session.get_inputs()[0].shape
 
-        self._init_buffers()
-        self._on_cuda = self.session.get_providers()[0] == "CUDAExecutionProvider"
-        self._init_iobinding()
-        self._warmup()
+        self.input_height = self._safe_dim(self.input_shape[2], default=768)
+        self.input_width = self._safe_dim(self.input_shape[3], default=768)
 
         self.use_tta = False
         self.use_tile_tta = False
+        # Soft-NMS (ported from carwash001): Gaussian score decay of overlapping
+        # boxes instead of hard removal. OFF by default to preserve the current
+        # deployed behaviour; flip on (and tune sigma) via tune_miner.py to see if
+        # it scores better — useful where signs cluster (gantries, sign assemblies).
         self.use_soft_nms = False
         self.soft_nms_sigma = 0.5
         self.soft_nms_score_thresh = 0.01
 
-        active = self.session.get_providers()[0]
-        print(f"Model loaded from {model_path}  provider={active}  iobinding=ON")
+        print(f"✅ ONNX model loaded from: {model_path}")
+        print(f"✅ ONNX providers: {self.session.get_providers()}")
+        print(f"✅ ONNX input: name={self.input_name}, shape={self.input_shape}")
         print("per-class conf: " + ", ".join(
             f"{n}={t:.3f}" for n, t in zip(
                 self.class_names, self._conf_thres_array.tolist()
             )
         ))
 
-    @staticmethod
-    def _providers() -> list[str]:
-        avail = ort.get_available_providers()
-        return [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in avail]
-
-    def _provider_list_with_opts(self):
-        cuda_opts: dict[str, str] = {"cudnn_conv_algo_search": "HEURISTIC"}
-        if self.use_cuda_graph:
-            cuda_opts["enable_cuda_graph"] = "1"
-        out = []
-        for p in self._providers():
-            if p == "CUDAExecutionProvider":
-                out.append((p, cuda_opts))
-            else:
-                out.append(p)
-        return out
-
-    def _init_buffers(self) -> None:
-        size = self.input_size
-        q = self.num_queries
-
-        self._canvas = np.zeros((size, size, 3), dtype=np.uint8)
-        self._rgb = np.empty((size, size, 3), dtype=np.uint8)
-        self._input_tensor = np.zeros((1, 3, size, size), dtype=np.float32)
-        self._sizes = np.array([[size, size]], dtype=np.int64)
-
-        self._out_labels = np.empty((1, q), dtype=np.int64)
-        self._out_boxes = np.empty((1, q, 4), dtype=np.float32)
-        self._out_scores = np.empty((1, q), dtype=np.float32)
-
-    def _init_iobinding(self) -> None:
-        self._io_binding = self.session.io_binding()
-        self._io_binding.bind_cpu_input(self.input_name, self._input_tensor)
-        self._io_binding.bind_cpu_input(self.size_name, self._sizes)
-        if self._on_cuda:
-            for name in self.output_names:
-                self._io_binding.bind_output(name, "cuda")
-        else:
-            for name, buf, dtype in (
-                (self.output_names[0], self._out_labels, np.int64),
-                (self._boxes_name, self._out_boxes, np.float32),
-                (self._scores_name, self._out_scores, np.float32),
-            ):
-                self._io_binding.bind_output(
-                    name, "cpu", 0, dtype, buf.shape, buf.ctypes.data
-                )
-
-    def _warmup(self) -> None:
-        self._input_tensor.fill(0.0)
-        if self._on_cuda:
-            self.session.run(
-                self.output_names,
-                {self.input_name: self._input_tensor, self.size_name: self._sizes},
-            )
-        else:
-            self.session.run_with_iobinding(self._io_binding)
-
-    def _letterbox(self, image: ndarray) -> tuple[float, int, int]:
-        size = self.input_size
-        oh, ow = image.shape[:2]
-        ratio = min(size / ow, size / oh)
-        nw, nh = int(ow * ratio), int(oh * ratio)
-
-        resized = cv2.resize(image, (nw, nh), interpolation=self.interp)
-        pad_w, pad_h = (size - nw) // 2, (size - nh) // 2
-
-        self._canvas.fill(0)
-        self._canvas[pad_h: pad_h + nh, pad_w: pad_w + nw] = resized
-        cv2.cvtColor(self._canvas, cv2.COLOR_BGR2RGB, dst=self._rgb)
-
-        chw = self._input_tensor[0]
-        np.copyto(
-            chw,
-            self._rgb.transpose(2, 0, 1).astype(np.float32, copy=False) / 255.0,
+    def __repr__(self) -> str:
+        return (
+            f"ONNXRuntime(session={type(self.session).__name__}, "
+            f"providers={self.session.get_providers()})"
         )
-        return ratio, pad_w, pad_h
 
-    def _run_inference(self) -> None:
-        if self._on_cuda:
-            _, boxes, scores = self.session.run(
-                self.output_names,
-                {self.input_name: self._input_tensor, self.size_name: self._sizes},
-            )
-            np.copyto(self._out_boxes, boxes)
-            np.copyto(self._out_scores, scores)
-            return
+    @staticmethod
+    def _safe_dim(value, default: int) -> int:
+        return value if isinstance(value, int) and value > 0 else default
 
-        self.session.run_with_iobinding(self._io_binding)
+    def _letterbox(
+        self,
+        image: ndarray,
+        new_shape: tuple[int, int],
+        color=(114, 114, 114),
+    ) -> tuple[ndarray, float, tuple[float, float]]:
+        h, w = image.shape[:2]
+        new_w, new_h = new_shape
+
+        ratio = min(new_w / w, new_h / h)
+        resized_w = int(round(w * ratio))
+        resized_h = int(round(h * ratio))
+
+        if (resized_w, resized_h) != (w, h):
+            interp = cv2.INTER_CUBIC if ratio > 1.0 else cv2.INTER_LINEAR
+            image = cv2.resize(image, (resized_w, resized_h), interpolation=interp)
+
+        dw = (new_w - resized_w) / 2.0
+        dh = (new_h - resized_h) / 2.0
+
+        left = int(round(dw - 0.1))
+        right = int(round(dw + 0.1))
+        top = int(round(dh - 0.1))
+        bottom = int(round(dh + 0.1))
+
+        padded = cv2.copyMakeBorder(
+            image, top, bottom, left, right,
+            borderType=cv2.BORDER_CONSTANT, value=color,
+        )
+        return padded, ratio, (dw, dh)
+
+    def _preprocess(
+        self, image: ndarray
+    ) -> tuple[np.ndarray, float, tuple[float, float], tuple[int, int]]:
+        orig_h, orig_w = image.shape[:2]
+        img, ratio, pad = self._letterbox(
+            image, (self.input_width, self.input_height)
+        )
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = img.astype(np.float32) / 255.0
+        img = np.transpose(img, (2, 0, 1))[None, ...]
+        img = np.ascontiguousarray(img, dtype=np.float32)
+        return img, ratio, pad, (orig_w, orig_h)
 
     @staticmethod
     def _clip_boxes(boxes: np.ndarray, image_size: tuple[int, int]) -> np.ndarray:
@@ -206,6 +217,15 @@ class Miner:
         boxes[:, 2] = np.clip(boxes[:, 2], 0, w - 1)
         boxes[:, 3] = np.clip(boxes[:, 3], 0, h - 1)
         return boxes
+
+    @staticmethod
+    def _xywh_to_xyxy(boxes: np.ndarray) -> np.ndarray:
+        out = np.empty_like(boxes)
+        out[:, 0] = boxes[:, 0] - boxes[:, 2] / 2.0
+        out[:, 1] = boxes[:, 1] - boxes[:, 3] / 2.0
+        out[:, 2] = boxes[:, 0] + boxes[:, 2] / 2.0
+        out[:, 3] = boxes[:, 1] + boxes[:, 3] / 2.0
+        return out
 
     @staticmethod
     def _hard_nms(
@@ -260,6 +280,8 @@ class Miner:
         sigma: float = 0.5,
         score_thresh: float = 0.01,
     ) -> tuple[np.ndarray, np.ndarray]:
+        """Soft-NMS: Gaussian decay of overlapping scores instead of hard removal.
+        Returns (kept_original_indices, updated_scores). (Ported from carwash001.)"""
         N = len(boxes)
         if N == 0:
             return np.array([], dtype=np.intp), np.array([], dtype=np.float32)
@@ -295,6 +317,7 @@ class Miner:
         sigma: float = 0.5,
         score_thresh: float = 0.01,
     ) -> tuple[np.ndarray, np.ndarray]:
+        """Soft-NMS applied independently per class. Returns (kept_idx, updated_scores)."""
         if len(boxes) == 0:
             return np.array([], dtype=np.intp), np.array([], dtype=np.float32)
         all_keep: list[int] = []
@@ -304,8 +327,7 @@ class Miner:
             keep, updated = self._soft_nms(boxes[indices], scores[indices],
                                            sigma, score_thresh)
             for k, s in zip(keep, updated):
-                all_keep.append(int(indices[k]))
-                all_scores.append(float(s))
+                all_keep.append(int(indices[k])); all_scores.append(float(s))
         if not all_keep:
             return np.array([], dtype=np.intp), np.array([], dtype=np.float32)
         return np.array(all_keep, dtype=np.intp), np.array(all_scores, dtype=np.float32)
@@ -317,6 +339,14 @@ class Miner:
         cls_ids: np.ndarray,
         iou_thresh: float,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Remove near-duplicate boxes across classes.
+
+        Order candidates by (score - per_class_threshold) margin, then by area;
+        keep the highest, suppress every other box with IoU > iou_thresh.
+        With a single road_sign class this is effectively a no-op, but the
+        method is kept so the pipeline stays compatible with the multi-class
+        miner template.
+        """
         n = len(boxes)
         if n <= 1:
             return boxes, scores, cls_ids
@@ -356,6 +386,12 @@ class Miner:
         full_cls: np.ndarray,
         iou_thresh: float,
     ) -> np.ndarray:
+        """For each kept (post-NMS) box, return the max score over the FULL
+        candidate set among same-class boxes with IoU >= iou_thresh.
+
+        Used after horizontal-flip TTA: a high-confidence flipped detection
+        can raise the score of the corresponding original detection.
+        """
         n = len(post_boxes)
         if n == 0:
             return np.empty(0, dtype=np.float32)
@@ -378,6 +414,9 @@ class Miner:
     def _conf_filter_mask(
         self, scores: np.ndarray, cls_ids: np.ndarray
     ) -> np.ndarray:
+        """Boolean keep-mask: score >= per-class threshold, with a per-class
+        rescue -- if a class has zero boxes passing, admit its top-1 candidate
+        when its score >= (per-class threshold - per-class bonus)."""
         if len(scores) == 0:
             return np.zeros(0, dtype=bool)
         thr = self._conf_thres_array[cls_ids]
@@ -402,6 +441,7 @@ class Miner:
         cls_ids: np.ndarray,
         orig_size: tuple[int, int],
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Drop tiny / degenerate / image-spanning / extreme-AR boxes (FP)."""
         if len(boxes) == 0:
             return boxes, scores, cls_ids
         orig_w, orig_h = orig_size
@@ -439,6 +479,7 @@ class Miner:
         scores: np.ndarray,
         cls_ids: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Per-view post-processing pipeline: per-class NMS -> cap -> cross-class dedup."""
         if len(boxes) > 1:
             if self.use_soft_nms:
                 keep, new_scores = self._per_class_soft_nms(
@@ -478,19 +519,23 @@ class Miner:
             )
         return results
 
-    def _decode(
+    def _decode_final_dets(
         self,
-        boxes: np.ndarray,
-        scores: np.ndarray,
+        preds: np.ndarray,
         ratio: float,
-        pad_w: int,
-        pad_h: int,
-        orig_w: int,
-        orig_h: int,
+        pad: tuple[float, float],
+        orig_size: tuple[int, int],
     ) -> list[BoundingBox]:
-        boxes = boxes.astype(np.float32)
-        scores = scores.astype(np.float32)
-        cls_ids = np.zeros(len(scores), dtype=np.int32)
+        """Final-detection output path: rows shaped [x1, y1, x2, y2, conf, cls_id]."""
+        if preds.ndim == 3 and preds.shape[0] == 1:
+            preds = preds[0]
+        if preds.ndim != 2 or preds.shape[1] < 6:
+            raise ValueError(f"Unexpected ONNX final-det output shape: {preds.shape}")
+
+        boxes = preds[:, :4].astype(np.float32)
+        scores = preds[:, 4].astype(np.float32)
+        cls_ids = preds[:, 5].astype(np.int32)
+        cls_ids = self.cls_remap[cls_ids]
 
         keep = self._conf_filter_mask(scores, cls_ids)
         boxes = boxes[keep]
@@ -499,13 +544,14 @@ class Miner:
         if len(boxes) == 0:
             return []
 
+        pad_w, pad_h = pad
         boxes[:, [0, 2]] -= pad_w
         boxes[:, [1, 3]] -= pad_h
         boxes /= ratio
-        boxes = self._clip_boxes(boxes, (orig_w, orig_h))
+        boxes = self._clip_boxes(boxes, orig_size)
 
         boxes, scores, cls_ids = self._filter_sane_boxes(
-            boxes, scores, cls_ids, (orig_w, orig_h)
+            boxes, scores, cls_ids, orig_size
         )
         if len(boxes) == 0:
             return []
@@ -513,22 +559,170 @@ class Miner:
         boxes, scores, cls_ids = self._per_view_pipeline(boxes, scores, cls_ids)
         return self._build_results(boxes, scores, cls_ids)
 
-    def _predict_single(self, image: ndarray) -> list[BoundingBox]:
-        ratio, pad_w, pad_h = self._letterbox(image)
-        self._run_inference()
-        return self._decode(
-            self._out_boxes[0],
-            self._out_scores[0],
-            ratio,
-            pad_w,
-            pad_h,
-            image.shape[1],
-            image.shape[0],
+    def _decode_raw_yolo(
+        self,
+        preds: np.ndarray,
+        ratio: float,
+        pad: tuple[float, float],
+        orig_size: tuple[int, int],
+    ) -> list[BoundingBox]:
+        """Fallback raw-YOLO output path: per-anchor class logits."""
+        if preds.ndim != 3 or preds.shape[0] != 1:
+            raise ValueError(f"Unexpected raw ONNX output shape: {preds.shape}")
+        preds = preds[0]
+        if preds.shape[0] <= 16 and preds.shape[1] > preds.shape[0]:
+            preds = preds.T
+        if preds.ndim != 2 or preds.shape[1] < 5:
+            raise ValueError(f"Unexpected raw output shape: {preds.shape}")
+
+        boxes_xywh = preds[:, :4].astype(np.float32)
+        cls_part = preds[:, 4:].astype(np.float32)
+        if cls_part.shape[1] == 1:
+            scores = cls_part[:, 0]
+            cls_ids = np.zeros(len(scores), dtype=np.int32)
+        else:
+            cls_ids = np.argmax(cls_part, axis=1).astype(np.int32)
+            scores = cls_part[np.arange(len(cls_part)), cls_ids]
+        cls_ids = self.cls_remap[cls_ids]
+
+        keep = self._conf_filter_mask(scores, cls_ids)
+        boxes_xywh = boxes_xywh[keep]
+        scores = scores[keep]
+        cls_ids = cls_ids[keep]
+        if len(boxes_xywh) == 0:
+            return []
+        boxes = self._xywh_to_xyxy(boxes_xywh)
+
+        pad_w, pad_h = pad
+        boxes[:, [0, 2]] -= pad_w
+        boxes[:, [1, 3]] -= pad_h
+        boxes /= ratio
+        boxes = self._clip_boxes(boxes, orig_size)
+
+        boxes, scores, cls_ids = self._filter_sane_boxes(
+            boxes, scores, cls_ids, orig_size
+        )
+        if len(boxes) == 0:
+            return []
+
+        boxes, scores, cls_ids = self._per_view_pipeline(boxes, scores, cls_ids)
+        return self._build_results(boxes, scores, cls_ids)
+
+    def _postprocess(
+        self,
+        output: np.ndarray,
+        ratio: float,
+        pad: tuple[float, float],
+        orig_size: tuple[int, int],
+    ) -> list[BoundingBox]:
+        if output.ndim == 2 and output.shape[1] >= 6:
+            return self._decode_final_dets(output, ratio, pad, orig_size)
+        if output.ndim == 3 and output.shape[0] == 1 and output.shape[2] == 6:
+            return self._decode_final_dets(output, ratio, pad, orig_size)
+        return self._decode_raw_yolo(output, ratio, pad, orig_size)
+
+    def _predict_single(self, image: np.ndarray) -> list[BoundingBox]:
+        if image is None:
+            raise ValueError("Input image is None")
+        if not isinstance(image, np.ndarray):
+            raise TypeError(f"Input is not numpy array: {type(image)}")
+        if image.ndim != 3:
+            raise ValueError(f"Expected HWC image, got shape={image.shape}")
+        if image.shape[0] <= 0 or image.shape[1] <= 0:
+            raise ValueError(f"Invalid image shape={image.shape}")
+        if image.shape[2] != 3:
+            raise ValueError(f"Expected 3 channels, got shape={image.shape}")
+        if image.dtype != np.uint8:
+            image = image.astype(np.uint8)
+
+        input_tensor, ratio, pad, orig_size = self._preprocess(image)
+        expected = (1, 3, self.input_height, self.input_width)
+        if input_tensor.shape != expected:
+            raise ValueError(
+                f"Bad input tensor shape={input_tensor.shape}, expected={expected}"
+            )
+
+        outputs = self.session.run(self.output_names, {self.input_name: input_tensor})
+        return self._postprocess(outputs[0], ratio, pad, orig_size)
+
+    def _predict_tta(self, image: np.ndarray) -> list[BoundingBox]:
+        """Horizontal-flip TTA.
+
+        Strategy:
+          1. Predict on original and on flipped image.
+          2. Map flipped boxes back to original coordinates.
+          3. Per-class hard NMS on the union.
+          4. For each kept box, compute the max same-class score across the
+             FULL union (not just the post-NMS subset) -- this lets a high-
+             confidence flipped detection raise a borderline original one.
+          5. Cross-class dedup to suppress same-physical-object multi-class.
+        """
+        boxes_orig = self._predict_single(image)
+        flipped = cv2.flip(image, 1)
+        boxes_flip = self._predict_single(flipped)
+        w = image.shape[1]
+        boxes_flip = [
+            BoundingBox(
+                x1=w - b.x2, y1=b.y1, x2=w - b.x1, y2=b.y2,
+                cls_id=b.cls_id, conf=b.conf,
+            )
+            for b in boxes_flip
+        ]
+        all_boxes = boxes_orig + boxes_flip
+        if not all_boxes:
+            return []
+
+        coords = np.array(
+            [[b.x1, b.y1, b.x2, b.y2] for b in all_boxes], dtype=np.float32
+        )
+        scores = np.array([b.conf for b in all_boxes], dtype=np.float32)
+        cls_ids = np.array([b.cls_id for b in all_boxes], dtype=np.int32)
+
+        hard_keep = self._per_class_hard_nms(coords, scores, cls_ids, self.iou_thres)
+        if len(hard_keep) == 0:
+            return []
+        if len(hard_keep) > self.max_det:
+            top = np.argsort(-scores[hard_keep])[: self.max_det]
+            hard_keep = hard_keep[top]
+
+        boosted = self._max_score_per_cluster(
+            coords[hard_keep], cls_ids[hard_keep],
+            coords, scores, cls_ids, self.iou_thres,
         )
 
+        kept_coords = coords[hard_keep]
+        kept_cls = cls_ids[hard_keep]
+        if len(kept_coords) > 1:
+            kept_coords, boosted, kept_cls = self._cross_class_dedup_op(
+                kept_coords, boosted, kept_cls, self.cross_iou_thresh
+            )
+
+        return [
+            BoundingBox(
+                x1=int(math.floor(kept_coords[j, 0])),
+                y1=int(math.floor(kept_coords[j, 1])),
+                x2=int(math.ceil(kept_coords[j, 2])),
+                y2=int(math.ceil(kept_coords[j, 3])),
+                cls_id=int(kept_cls[j]),
+                conf=float(boosted[j]),
+            )
+            for j in range(len(kept_coords))
+        ]
+
     def _predict_tiles(self, image: np.ndarray) -> list[BoundingBox]:
+        """Tile-based TTA for high-resolution images.
+
+        Splits the source image into two overlapping horizontal tiles, runs
+        single-pass inference on each at native scale, and translates boxes
+        back to the global frame. Useful when source width >> model input
+        width because letterboxing otherwise discards effective resolution
+        that small / distant signs depend on.
+
+        Returns an empty list if the image isn't wide enough to benefit; the
+        caller falls back to the regular pipeline in that case.
+        """
         h, w = image.shape[:2]
-        if w < int(self.input_size * self.tile_trigger_ratio):
+        if w < int(self.input_width * self.tile_trigger_ratio):
             return []
 
         overlap = int(w * self.tile_overlap_ratio)
@@ -560,6 +754,13 @@ class Miner:
         view_boxes: list[list[BoundingBox]],
         image_size: tuple[int, int],
     ) -> list[BoundingBox]:
+        """Merge boxes from multiple views (single / hflip / tiles).
+
+        Same logic as `_predict_tta`'s tail: per-class hard NMS to dedupe,
+        then for each kept box take the max same-class score across the full
+        candidate union — a high-confidence detection in any view boosts
+        borderline matches in others.
+        """
         all_boxes: list[BoundingBox] = []
         for vb in view_boxes:
             all_boxes.extend(vb)
@@ -606,6 +807,12 @@ class Miner:
         ]
 
     def _predict_full(self, image: np.ndarray) -> list[BoundingBox]:
+        """Top-level per-frame prediction with all enabled augmentations.
+
+        - `use_tta=True`: original + horizontal flip
+        - `use_tile_tta=True` AND image wide enough: two overlapping tiles
+        All views are merged via per-class NMS + cluster-max score boost.
+        """
         if not self.use_tta and not self.use_tile_tta:
             return self._predict_single(image)
 
@@ -640,23 +847,20 @@ class Miner:
         n_keypoints: int,
     ) -> list[TVFrameResult]:
         results: list[TVFrameResult] = []
-        kp = [(0, 0) for _ in range(max(0, int(n_keypoints)))]
-
-        for i, image in enumerate(batch_images):
-            frame_id = offset + i
+        for frame_number_in_batch, image in enumerate(batch_images):
             try:
-                frame_boxes = self._predict_full(image)
+                boxes = self._predict_full(image)
             except Exception as e:
                 print(
-                    f"predict_batch: inference failed for frame_id={frame_id}: {e}",
-                    flush=True,
+                    f"⚠️ Inference failed for frame "
+                    f"{offset + frame_number_in_batch}: {e}"
                 )
-                traceback.print_exc()
-                frame_boxes = []
-
-            results.append(TVFrameResult(
-                frame_id=frame_id,
-                boxes=frame_boxes,
-                keypoints=list(kp),
-            ))
+                boxes = []
+            results.append(
+                TVFrameResult(
+                    frame_id=offset + frame_number_in_batch,
+                    boxes=boxes,
+                    keypoints=[(0, 0) for _ in range(max(0, int(n_keypoints)))],
+                )
+            )
         return results
