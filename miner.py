@@ -1,5 +1,4 @@
 from pathlib import Path
-import math
 
 import cv2
 import numpy as np
@@ -25,7 +24,6 @@ class TVFrameResult(BaseModel):
 
 class Miner:
     """ONNX Runtime miner for road-sign detection (single class).
-
     Strategy (ported from offense / fire001 miner):
       - per-class confidence threshold with per-class rescue bonus
       - per-class hard NMS, then cross-class dedup (no-op for single class)
@@ -34,11 +32,11 @@ class Miner:
     TTA toggle.
     """
 
-    class_names = ["road_sign"]
+    class_names = ["road sign"]
     # Order the model emits classes in -- remapped to `class_names` index.
-    _model_class_order = ["road_sign"]
+    _model_class_order = ["road sign"]
 
-    iou_thres = 0.7
+    iou_thres = 0.5
     cross_iou_thresh = 0.8
     max_det = 150
 
@@ -48,7 +46,7 @@ class Miner:
     # false_positive pillar = max(0, 1 - ffpi/10): we can tolerate ~2 FP per
     # image and still keep that pillar above 0.8.
     _conf_thres_array = np.array(
-        [0.30], dtype=np.float32
+        [0.33], dtype=np.float32
     )
     # Per-class rescue bonus. If a class has ZERO boxes passing the threshold
     # in a frame, its top-1 candidate is admitted when its score is at least
@@ -56,7 +54,7 @@ class Miner:
     # an otherwise empty frame still produces a detection (map50 recall win,
     # at most one extra FP per such frame).
     _bonus_array = np.array(
-        [0.2], dtype=np.float32
+        [0.18], dtype=np.float32
     )
 
     # Box sanity filter: drop tiny / degenerate / image-spanning / extreme
@@ -70,7 +68,7 @@ class Miner:
     #                         -> overhead destination panels and lane-assignment
     #                          signs are very wide (long, thin rectangles);
     #                          8.0 was clipping legitimate detections.
-    min_box_area = 14 * 14
+    min_box_area = 8 * 8
     min_side = 3
     max_aspect_ratio = 12.0
 
@@ -85,10 +83,6 @@ class Miner:
 
     def __init__(self, path_hf_repo: Path) -> None:
         model_path = path_hf_repo / "weights.onnx"
-        self.cls_remap = np.array(
-            [self.class_names.index(n) for n in self._model_class_order],
-            dtype=np.int32,
-        )
         print("ORT version:", ort.__version__)
 
         try:
@@ -101,11 +95,9 @@ class Miner:
 
         sess_options = ort.SessionOptions()
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        # The public-track latency gate runs CPU-only on 2 vCPUs. Without this,
-        # ORT spawns a thread per host core and oversubscribes the 2 cores
-        # (~5.5x slower). Pin to 2 intra-op threads / 1 inter-op to match.
         sess_options.intra_op_num_threads = 2
         sess_options.inter_op_num_threads = 1
+        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 
         try:
             self.session = ort.InferenceSession(
@@ -113,9 +105,7 @@ class Miner:
                 sess_options=sess_options,
                 providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
             )
-            print("✅ Created ORT session with preferred CUDA provider list")
-        except Exception as e:
-            print(f"⚠️ CUDA session creation failed, falling back to CPU: {e}")
+        except Exception:
             self.session = ort.InferenceSession(
                 str(model_path),
                 sess_options=sess_options,
@@ -123,6 +113,23 @@ class Miner:
             )
 
         print("ORT session providers:", self.session.get_providers())
+
+        # Build cls_remap: for each model-emit index i,
+        #   cls_remap[i] = self.class_names.index(model_class_order[i])
+        # i.e. convert a model-side class id into the output class id that
+        # downstream code (BoundingBox.cls_id, the per-class threshold/bonus
+        # arrays) expects. The model-side order comes from the ONNX metadata
+        # when available, else falls back to the static _model_class_order.
+        model_class_order = self._read_model_class_order()
+        if model_class_order is None:
+            model_class_order = list(self._model_class_order)
+            print(f"cls order: no usable ONNX metadata, FALLBACK {model_class_order}")
+        else:
+            print(f"cls order: from ONNX metadata {model_class_order}")
+        self.cls_remap = np.array(
+            [self.class_names.index(n) for n in model_class_order],
+            dtype=np.int32,
+        )
 
         for inp in self.session.get_inputs():
             print("INPUT:", inp.name, inp.shape, inp.type)
@@ -133,8 +140,11 @@ class Miner:
         self.output_names = [output.name for output in self.session.get_outputs()]
         self.input_shape = self.session.get_inputs()[0].shape
 
-        self.input_height = self._safe_dim(self.input_shape[2], default=768)
-        self.input_width = self._safe_dim(self.input_shape[3], default=768)
+        # weights.onnx is exported at 640x640 (Ultralytics imgsz metadata),
+        # static (dynamic=False). The default is only the fallback for when the
+        # ONNX input dims aren't fixed; the real value is read from the session.
+        self.input_height = self._safe_dim(self.input_shape[2], default=640)
+        self.input_width = self._safe_dim(self.input_shape[3], default=640)
 
         self.use_tta = False
         self.use_tile_tta = False
@@ -149,11 +159,49 @@ class Miner:
         print(f"✅ ONNX model loaded from: {model_path}")
         print(f"✅ ONNX providers: {self.session.get_providers()}")
         print(f"✅ ONNX input: name={self.input_name}, shape={self.input_shape}")
+        print(f"✅ ONNX input size: {self.input_width}x{self.input_height}, "
+              f"use_tta={self.use_tta}, use_tile_tta={self.use_tile_tta}")
         print("per-class conf: " + ", ".join(
             f"{n}={t:.3f}" for n, t in zip(
                 self.class_names, self._conf_thres_array.tolist()
             )
         ))
+
+        self._warmup()
+
+    def _warmup(self, iters: int = 3) -> None:
+        try:
+            dummy = np.zeros((720, 1280, 3), dtype=np.uint8)
+            for _ in range(max(1, iters)):
+                self.predict_batch(batch_images=[dummy], offset=0, n_keypoints=0)
+            print(f"✅ warmup: {iters} dummy predict_batch call(s) done")
+        except Exception as e:
+            print(f"⚠️ warmup skipped: {e}")
+
+    def _read_model_class_order(self) -> "list[str] | None":
+        """Read the model's class order from Ultralytics ONNX metadata.
+        Returns the class names ordered by model-emit index, or None when the
+        metadata is missing/unparsable or doesn't match `class_names` as a set
+        (in which case the static _model_class_order fallback is used)."""
+        try:
+            import ast
+
+            meta = self.session.get_modelmeta().custom_metadata_map
+            names = ast.literal_eval(meta["names"])  # e.g. {0: 'road_sign'}
+            if isinstance(names, dict):
+                order = [str(names[i]) for i in sorted(names)]
+            else:
+                order = [str(n) for n in names]
+        except Exception as e:
+            print(f"cls order: could not read ONNX names metadata ({e})")
+            return None
+        if sorted(order) != sorted(self.class_names):
+            print(
+                f"cls order: ONNX names {order} do not match expected classes "
+                f"{self.class_names}; ignoring metadata"
+            )
+            return None
+        return order
 
     def __repr__(self) -> str:
         return (
@@ -203,11 +251,11 @@ class Miner:
         img, ratio, pad = self._letterbox(
             image, (self.input_width, self.input_height)
         )
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = img.astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1))[None, ...]
-        img = np.ascontiguousarray(img, dtype=np.float32)
-        return img, ratio, pad, (orig_w, orig_h)
+        # Fused scale(1/255) + BGR->RGB swap + HWC->NCHW + contiguous float32 in
+        # one optimized OpenCV call (bit-identical to the cvtColor + astype/255 +
+        # transpose chain, but ~half the preprocess time).
+        blob = cv2.dnn.blobFromImage(img, scalefactor=1.0 / 255.0, swapRB=True)
+        return blob, ratio, pad, (orig_w, orig_h)
 
     @staticmethod
     def _clip_boxes(boxes: np.ndarray, image_size: tuple[int, int]) -> np.ndarray:
@@ -340,7 +388,6 @@ class Miner:
         iou_thresh: float,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Remove near-duplicate boxes across classes.
-
         Order candidates by (score - per_class_threshold) margin, then by area;
         keep the highest, suppress every other box with IoU > iou_thresh.
         With a single road_sign class this is effectively a no-op, but the
@@ -388,7 +435,6 @@ class Miner:
     ) -> np.ndarray:
         """For each kept (post-NMS) box, return the max score over the FULL
         candidate set among same-class boxes with IoU >= iou_thresh.
-
         Used after horizontal-flip TTA: a high-confidence flipped detection
         can raise the score of the corresponding original detection.
         """
@@ -509,10 +555,10 @@ class Miner:
                 continue
             results.append(
                 BoundingBox(
-                    x1=int(math.floor(x1)),
-                    y1=int(math.floor(y1)),
-                    x2=int(math.ceil(x2)),
-                    y2=int(math.ceil(y2)),
+                    x1=int(round(x1)),
+                    y1=int(round(y1)),
+                    x2=int(round(x2)),
+                    y2=int(round(y2)),
                     cls_id=int(cls_id),
                     conf=float(conf),
                 )
@@ -647,7 +693,6 @@ class Miner:
 
     def _predict_tta(self, image: np.ndarray) -> list[BoundingBox]:
         """Horizontal-flip TTA.
-
         Strategy:
           1. Predict on original and on flipped image.
           2. Map flipped boxes back to original coordinates.
@@ -699,10 +744,10 @@ class Miner:
 
         return [
             BoundingBox(
-                x1=int(math.floor(kept_coords[j, 0])),
-                y1=int(math.floor(kept_coords[j, 1])),
-                x2=int(math.ceil(kept_coords[j, 2])),
-                y2=int(math.ceil(kept_coords[j, 3])),
+                x1=int(round(kept_coords[j, 0])),
+                y1=int(round(kept_coords[j, 1])),
+                x2=int(round(kept_coords[j, 2])),
+                y2=int(round(kept_coords[j, 3])),
                 cls_id=int(kept_cls[j]),
                 conf=float(boosted[j]),
             )
@@ -711,13 +756,11 @@ class Miner:
 
     def _predict_tiles(self, image: np.ndarray) -> list[BoundingBox]:
         """Tile-based TTA for high-resolution images.
-
         Splits the source image into two overlapping horizontal tiles, runs
         single-pass inference on each at native scale, and translates boxes
         back to the global frame. Useful when source width >> model input
         width because letterboxing otherwise discards effective resolution
         that small / distant signs depend on.
-
         Returns an empty list if the image isn't wide enough to benefit; the
         caller falls back to the regular pipeline in that case.
         """
@@ -755,7 +798,6 @@ class Miner:
         image_size: tuple[int, int],
     ) -> list[BoundingBox]:
         """Merge boxes from multiple views (single / hflip / tiles).
-
         Same logic as `_predict_tta`'s tail: per-class hard NMS to dedupe,
         then for each kept box take the max same-class score across the full
         candidate union — a high-confidence detection in any view boosts
@@ -796,10 +838,10 @@ class Miner:
 
         return [
             BoundingBox(
-                x1=int(math.floor(kept_coords[j, 0])),
-                y1=int(math.floor(kept_coords[j, 1])),
-                x2=int(math.ceil(kept_coords[j, 2])),
-                y2=int(math.ceil(kept_coords[j, 3])),
+                x1=int(round(kept_coords[j, 0])),
+                y1=int(round(kept_coords[j, 1])),
+                x2=int(round(kept_coords[j, 2])),
+                y2=int(round(kept_coords[j, 3])),
                 cls_id=int(kept_cls[j]),
                 conf=float(boosted[j]),
             )
@@ -808,7 +850,6 @@ class Miner:
 
     def _predict_full(self, image: np.ndarray) -> list[BoundingBox]:
         """Top-level per-frame prediction with all enabled augmentations.
-
         - `use_tta=True`: original + horizontal flip
         - `use_tile_tta=True` AND image wide enough: two overlapping tiles
         All views are merged via per-class NMS + cluster-max score boost.
