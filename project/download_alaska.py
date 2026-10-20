@@ -1,6 +1,6 @@
-"""Download the ALASKA v2 JPEG and TIFF datasets from https://alaska.utt.fr/.
+"""Download the ALASKA v2 JPEG, TIFF and RAW datasets from https://alaska.utt.fr/.
 
-Each dataset has 80,005 images named 00001 to 80005. Files that already exist
+Each dataset has 80,005 images numbered 00001 to 80005. Files that already exist
 are skipped, so an interrupted run can simply be restarted.
 
 Examples:
@@ -9,20 +9,31 @@ Examples:
     python download_alaska.py "ALASKA_v2_JPG_256_*" --out D:/alaska
     python download_alaska.py --all --out E:/alaska
     python download_alaska.py "*TIFF_256*" --first 1 --last 1000
+    python download_alaska.py --raw --first 1 --last 500
 """
 
 import argparse
 import fnmatch
+import io
 import os
 import shutil
 import sys
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 BASE_URL = "https://alaska.utt.fr/DATASETS"
 NUM_IMAGES = 80005
+
+# RAW camera files have mixed extensions (.NEF, .CR2, .dng, ...), so their names come from the list
+# inside the official scripts zip. --all deliberately excludes them: the full set is about 1.8 TB.
+RAW_DATASET = "ALASKA_v2_RAWs"
+RAW_GB = 1835.0  # estimated from 41 sampled files, about 23 MB each
+RAW_ZIP_URL = "https://alaska.utt.fr/ALASKA_v2_RAWs_scripts.zip"
+RAW_ZIP_LOCAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ALASKA_v2_RAWs_scripts.zip")
+RAW_LIST_IN_ZIP = "Download_script/list_RAWs_ALASKA_v2.txt"
 
 # Approximate full-dataset sizes in GB, estimated from 41 sampled files each.
 DATASETS = {
@@ -63,8 +74,27 @@ DATASETS = {
 }
 
 
-def extension(dataset):
-    return ".jpg" if "_JPG_" in dataset else ".tif"
+def raw_file_names():
+    """Read the 80,005 RAW file names from the scripts zip, downloading the zip if it isn't present."""
+    if os.path.exists(RAW_ZIP_LOCAL):
+        source = RAW_ZIP_LOCAL
+    else:
+        print(f"Fetching RAW file list from {RAW_ZIP_URL}")
+        with urllib.request.urlopen(RAW_ZIP_URL, timeout=60) as resp:
+            source = io.BytesIO(resp.read())
+    with zipfile.ZipFile(source) as z:
+        names = z.read(RAW_LIST_IN_ZIP).decode().split()
+    if len(names) != NUM_IMAGES:
+        sys.exit(f"Unexpected RAW list: {len(names)} names instead of {NUM_IMAGES}")
+    return names
+
+
+def file_names(dataset):
+    """All 80,005 file names of a dataset, in image-number order."""
+    if dataset == RAW_DATASET:
+        return raw_file_names()
+    ext = ".jpg" if "_JPG_" in dataset else ".tif"
+    return [f"{i:05d}{ext}" for i in range(1, NUM_IMAGES + 1)]
 
 
 def fetch(url, dest, retries):
@@ -89,11 +119,8 @@ def fetch(url, dest, retries):
 def download_dataset(dataset, out_root, first, last, workers, retries, log):
     out_dir = os.path.join(out_root, dataset)
     os.makedirs(out_dir, exist_ok=True)
-    ext = extension(dataset)
-
     todo = []
-    for i in range(first, last + 1):
-        name = f"{i:05d}{ext}"
+    for name in file_names(dataset)[first - 1:last]:
         dest = os.path.join(out_dir, name)
         if not os.path.exists(dest):
             todo.append((f"{BASE_URL}/{dataset}/{name}", dest, name))
@@ -134,7 +161,9 @@ def download_dataset(dataset, out_root, first, last, workers, retries, log):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("datasets", nargs="*", help="dataset names or wildcard patterns (e.g. '*TIFF_256*')")
-    parser.add_argument("--all", action="store_true", help="download all 34 JPEG and TIFF datasets")
+    parser.add_argument("--all", action="store_true", help="download all 34 JPEG and TIFF datasets (not RAW)")
+    parser.add_argument("--raw", action="store_true",
+                        help=f"download the original RAW camera files into {RAW_DATASET}/ (~{RAW_GB / 1000:.1f} TB in full)")
     parser.add_argument("--list", action="store_true", help="list available datasets with sizes and exit")
     parser.add_argument("--out", default=".", help="output folder (default: current folder)")
     parser.add_argument("--first", type=int, default=1, help="first image number (default 1)")
@@ -147,7 +176,8 @@ def main():
     if args.list:
         for name, gb in DATASETS.items():
             print(f"{gb:7.1f} GB  {name}")
-        print(f"{sum(DATASETS.values()):7.1f} GB  TOTAL")
+        print(f"{sum(DATASETS.values()):7.1f} GB  TOTAL (JPEG + TIFF, what --all downloads)")
+        print(f"{RAW_GB:7.1f} GB  {RAW_DATASET} (only with --raw)")
         return
 
     if args.all:
@@ -159,8 +189,10 @@ def main():
             if not matches:
                 parser.error(f"no dataset matches '{pattern}' (use --list to see names)")
             selected += [m for m in matches if m not in selected]
+    if args.raw:
+        selected.append(RAW_DATASET)
     if not selected:
-        parser.error("give dataset names/patterns, or --all (use --list to see names)")
+        parser.error("give dataset names/patterns, --all or --raw (use --list to see names)")
     if not 1 <= args.first <= args.last <= NUM_IMAGES:
         parser.error(f"need 1 <= --first <= --last <= {NUM_IMAGES}")
 
@@ -171,7 +203,7 @@ def main():
     for d in selected:
         folder = os.path.join(args.out, d)
         have = len(os.listdir(folder)) if os.path.isdir(folder) else 0
-        needed += DATASETS[d] * max(0.0, fraction - have / NUM_IMAGES)
+        needed += DATASETS.get(d, RAW_GB) * max(0.0, fraction - have / NUM_IMAGES)
     free = shutil.disk_usage(args.out).free / 1e9
     print(f"{len(selected)} dataset(s) selected; about {needed:.1f} GB still needed, {free:.1f} GB free")
     if needed > free * 0.95 and not args.force:

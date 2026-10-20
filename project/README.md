@@ -1,6 +1,6 @@
 # ALASKA v2 dataset download
 
-Scripts to download the [ALASKA v2](https://alaska.utt.fr/) image steganalysis datasets: the JPEG and TIFF image sets, plus the original RAW-processing scripts.
+Scripts to download the [ALASKA v2](https://alaska.utt.fr/) image steganalysis datasets: the JPEG and TIFF image sets and the original RAW camera files.
 
 ## Quick start
 
@@ -53,12 +53,16 @@ python download_alaska.py --all --out E:/alaska
 
 # Only part of each dataset (here, images 00001-05000)
 python download_alaska.py "*TIFF_256*" --first 1 --last 5000
+
+# RAW camera files (see "RAW images" below)
+python download_alaska.py --raw --first 1 --last 500
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
 | `datasets` | none | Dataset names or wildcard patterns |
-| `--all` | off | Download all 34 datasets |
+| `--all` | off | Download all 34 JPEG/TIFF datasets (does not include RAW) |
+| `--raw` | off | Also download the RAW camera files into `ALASKA_v2_RAWs/`. Can be combined with dataset names |
 | `--list` | off | List datasets with estimated sizes and exit |
 | `--out DIR` | `.` | Folder that receives one sub-folder per dataset |
 | `--first N` / `--last N` | `1` / `80005` | Range of image numbers to download |
@@ -79,14 +83,30 @@ python download_alaska.py "*TIFF_256*" --first 1 --last 5000
 
 | File | Purpose |
 |---|---|
-| `download_alaska.py` | Main downloader for all JPEG/TIFF datasets |
+| `download_alaska.py` | Main downloader for all JPEG, TIFF and RAW datasets |
 | `download_alaska.sh` | Older bash/curl script that downloads only `ALASKA_v2_JPG_256_QF100_COLOR` |
 | `ALASKA_v2_JPG_256_QF100_COLOR.sh` | Original script from the ALASKA site (needs `wget`) |
-| `ALASKA_v2_RAWs_scripts.zip` | Official RAW download and conversion scripts, plus `ALASKA2_documentation.pdf` |
+| `ALASKA_v2_RAWs_scripts.zip` | Official RAW download and conversion scripts, the RAW file list used by `--raw`, and `ALASKA2_documentation.pdf` |
 
-## RAW images (not covered by the downloader)
+## RAW images
 
-The original RAW photos (80,005 files in about 35 camera formats such as NEF, CR2 and DNG) total roughly **1.8 TB**, at about 23 MB per file. To get them, unzip `ALASKA_v2_RAWs_scripts.zip` and use `Download_script/ALASKA_v2_RAWs_download_script.sh`, which requires `wget` and a drive with at least 2 TB free. You only need the RAWs to develop your own image variants with the conversion scripts. Most steganalysis work can use the ready-made JPEG/TIFF sets.
+The original RAW photos (80,005 files in about 35 camera formats such as NEF, CR2 and DNG) total roughly **1.8 TB**, at about 23 MB per file, so plan on a drive with 2 TB free for the full set. Downloads run at about 2–3 files/s, so the full set takes several days.
+
+```bash
+python download_alaska.py --raw --first 1 --last 1000           # ~23 GB subset
+python download_alaska.py --raw --out E:/alaska                 # full set
+```
+
+- Files keep their original names and extensions (`00001.dng`, `18001.NEF`, ...). `--first`/`--last` select by image number as for the other datasets.
+- The file names come from `Download_script/list_RAWs_ALASKA_v2.txt` inside `ALASKA_v2_RAWs_scripts.zip`. If the zip isn't next to `download_alaska.py`, it is fetched from the ALASKA site (2.2 MB).
+- `--all` never includes RAW, so the 1.8 TB set is only downloaded when you ask for it.
+- To develop RAWs with the official conversion script, unzip `ALASKA_v2_RAWs_scripts.zip` and download into its `devHome` folder. The script reads RAWs from `devHome/ALASKA_v2_RAWs`, which is the folder `--raw` creates:
+
+  ```bash
+  python download_alaska.py --raw --out ALASKA_v2_RAWs_scripts/Conversion_script/devHome
+  ```
+
+You only need the RAWs to develop your own image variants. Most steganalysis work can use the ready-made JPEG/TIFF sets.
 
 ## Terms of use
 
